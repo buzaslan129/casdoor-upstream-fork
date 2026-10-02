@@ -230,10 +230,8 @@ func (c *ApiController) GetUser() {
 		return
 	}
 
-	requestUserId := c.GetSessionUsername()
-	isApplicationRequest := object.IsAppUser(requestUserId)
-	isAdmin := c.IsAdmin() || isApplicationRequest
-	isAdminOrSelf := c.IsAdminOrSelf(user) || isApplicationRequest
+	isAdmin := c.IsAdminOf(user)
+	isAdminOrSelf := c.IsAdminOrSelf(user)
 	user, err = object.GetMaskedUser(user, isAdminOrSelf)
 	if err != nil {
 		c.ResponseError(err.Error())
@@ -479,16 +477,29 @@ func (c *ApiController) GetEmailAndPhone() {
 		return
 	}
 
+	err = object.CheckLdapPasswordForget(user)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+
 	respUser := object.User{Name: user.Name}
 	var contentType string
-	switch username {
-	case user.Email:
+	// object.GetUserByFields() looks the user up after trimming the input, lowering
+	// the email and converting an E.164 phone to its national number, so the same
+	// normalization is needed here. Otherwise an input like "Abc@abc.com" finds the
+	// user but matches none of the cases below, and the response carries neither a
+	// content type nor a destination to send the verification code to.
+	username = strings.TrimSpace(username)
+	nationalPhone, _ := util.ParseE164Phone(username)
+	switch {
+	case user.Email != "" && strings.EqualFold(username, user.Email):
 		contentType = "email"
 		respUser.Email = user.Email
-	case user.Phone:
+	case user.Phone != "" && nationalPhone == user.Phone:
 		contentType = "phone"
 		respUser.Phone = user.Phone
-	case user.Name:
+	case strings.EqualFold(username, user.Name):
 		contentType = "username"
 		respUser.Email = util.GetMaskedEmail(user.Email)
 		respUser.Phone = util.GetMaskedPhone(user.Phone)
@@ -597,6 +608,15 @@ func (c *ApiController) SetPassword() {
 		return
 	}
 
+	// code != "" means the request comes from the forgot-password flow
+	if code != "" {
+		err = object.CheckLdapPasswordForget(targetUser)
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
+	}
+
 	isAdmin := c.IsAdmin()
 	if isAdmin {
 		if oldPassword != "" {
@@ -626,9 +646,13 @@ func (c *ApiController) SetPassword() {
 		return
 	}
 
-	// Check if the new password is the same as the current password
-	if !object.CheckPasswordNotSameAsCurrent(targetUser, newPassword, organization) {
-		c.ResponseError(c.T("user:The new password must be different from your current password"))
+	msg, err = object.CheckPasswordReuse(targetUser, newPassword, organization, c.GetAcceptLanguage())
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if msg != "" {
+		c.ResponseError(msg)
 		return
 	}
 
@@ -652,6 +676,14 @@ func (c *ApiController) SetPassword() {
 	if code != "" {
 		c.SetSession("verifiedCode", "")
 		c.SetSession("verifiedUserId", "")
+	}
+
+	if user.Ldap == "" {
+		err = targetUser.AddPasswordHistory(organization)
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
 	}
 
 	targetUser.Password = newPassword

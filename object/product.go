@@ -29,7 +29,7 @@ type Product struct {
 
 	Image                 string    `xorm:"varchar(100)" json:"image"`
 	Detail                string    `xorm:"varchar(1000)" json:"detail"`
-	Description           string    `xorm:"varchar(200)" json:"description"`
+	Description           string    `xorm:"mediumtext" json:"description"`
 	Tag                   string    `xorm:"varchar(100)" json:"tag"`
 	Currency              string    `xorm:"varchar(100)" json:"currency"`
 	Price                 float64   `json:"price"`
@@ -42,6 +42,8 @@ type Product struct {
 	SuccessUrl            string    `xorm:"varchar(1000)" json:"successUrl"`
 
 	State string `xorm:"varchar(100)" json:"state"`
+
+	Properties map[string]string `xorm:"mediumtext" json:"properties"`
 
 	ProviderObjs []*Provider `xorm:"-" json:"providerObjs"`
 }

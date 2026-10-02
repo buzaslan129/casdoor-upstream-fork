@@ -22,7 +22,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/casdoor/casdoor/i18n"
@@ -48,7 +47,10 @@ const (
 	DeviceAuthStatusTokenIssued = "token_issued"
 )
 
-var DeviceAuthMap = sync.Map{}
+// DeviceAuthMap stores the transient state of the OAuth 2.0 Device Authorization Grant (RFC 8628).
+// It defaults to an in-memory store; call InitDeviceAuthStore() at startup to switch to Redis
+// when redisEndpoint is configured, enabling correct behaviour across multiple replicas.
+var DeviceAuthMap deviceAuthStore = &memoryDeviceAuthStore{}
 
 type Code struct {
 	Message string `xorm:"varchar(100)" json:"message"`
@@ -103,6 +105,7 @@ type DeviceAuthCache struct {
 }
 
 func InitCleanupDeviceAuthMap() {
+	InitDeviceAuthStore()
 	util.SafeGoroutine(func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -246,27 +249,14 @@ func IsScopeValid(scope string, application *Application) bool {
 	return ok
 }
 
-func ExpireTokenByAccessToken(accessToken string) (bool, *Application, *Token, error) {
-	token, err := GetTokenByAccessToken(accessToken)
-	if err != nil {
-		return false, nil, nil, err
-	}
-	if token == nil {
-		return false, nil, nil, nil
-	}
-
+func ExpireToken(token *Token) (bool, error) {
 	token.ExpiresIn = 0
 	affected, err := ormer.Engine.ID(core.PK{token.Owner, token.Name}).Cols("expires_in").Update(token)
 	if err != nil {
-		return false, nil, nil, err
+		return false, err
 	}
 
-	application, err := getApplication(token.Owner, token.Application)
-	if err != nil {
-		return false, nil, nil, err
-	}
-
-	return affected != 0, application, token, nil
+	return affected != 0, nil
 }
 
 func CheckOAuthLogin(clientId string, responseType string, redirectUri string, scope string, state string, lang string) (string, *Application, error) {
@@ -296,7 +286,7 @@ func CheckOAuthLogin(clientId string, responseType string, redirectUri string, s
 	return "", application, nil
 }
 
-func GetOAuthCode(userId string, clientId string, provider string, signinMethod string, responseType string, redirectUri string, scope string, state string, nonce string, challenge string, resource string, host string, lang string) (*Code, error) {
+func GetOAuthCode(userId string, clientId string, provider string, signinMethod string, responseType string, redirectUri string, scope string, state string, nonce string, challenge string, resource string, sessionId string, host string, lang string) (*Code, error) {
 	user, err := GetUser(userId)
 	if err != nil {
 		return nil, err
@@ -375,6 +365,7 @@ func GetOAuthCode(userId string, clientId string, provider string, signinMethod 
 		CodeIsUsed:    false,
 		CodeExpireIn:  time.Now().Add(time.Minute * 5).Unix(),
 		Resource:      resource,
+		SessionId:     sessionId,
 	}
 	_, err = AddToken(token)
 	if err != nil {
@@ -387,7 +378,7 @@ func GetOAuthCode(userId string, clientId string, provider string, signinMethod 
 	}, nil
 }
 
-func RefreshToken(application *Application, grantType string, refreshToken string, scope string, clientId string, clientSecret string, host string, dpopProof string) (interface{}, error) {
+func RefreshToken(application *Application, grantType string, refreshToken string, scope string, clientId string, clientSecret string, resource string, host string, dpopProof string) (interface{}, error) {
 	if grantType != "refresh_token" {
 		return &TokenError{
 			Error:            UnsupportedGrantType,
@@ -433,6 +424,27 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 			ErrorDescription: "refresh token is expired",
 		}, nil
 	}
+
+	// The refresh token must belong to the authenticated client, exactly as the
+	// authorization_code exchange checks it. Without this a client may present a
+	// refresh token issued to a different application and, together with the
+	// audience restore below, mint a token carrying another grant's resource.
+	if application.Name != token.Application {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: fmt.Sprintf("the token is for wrong application (client_id), application.Name: [%s], token.Application: [%s]", application.Name, token.Application),
+		}, nil
+	}
+
+	// RFC 8707: the refreshed token must keep the audience of the original grant.
+	// The client MAY repeat the resource parameter; when it does, it has to match.
+	if resource != "" && resource != token.Resource {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: fmt.Sprintf("resource parameter does not match the original grant, expected: [%s], got: [%s]", token.Resource, resource),
+		}, nil
+	}
+	resource = token.Resource
 
 	cert, err := getCertByApplication(application)
 	if err != nil {
@@ -491,7 +503,7 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 		return nil, err
 	}
 
-	newAccessToken, newRefreshToken, tokenName, err := generateJwtToken(application, user, "", "", "", scope, "", host)
+	newAccessToken, newRefreshToken, tokenName, err := generateJwtToken(application, user, "", "", "", scope, resource, host)
 	if err != nil {
 		return &TokenError{
 			Error:            EndpointError,
@@ -512,6 +524,9 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 		ExpiresIn:    int(application.ExpireInHours * float64(hourSeconds)),
 		Scope:        scope,
 		TokenType:    "Bearer",
+		Resource:     resource,
+		// the refreshed token stays bound to the login session that minted the original one
+		SessionId: token.SessionId,
 	}
 	_, err = AddToken(newToken)
 	if err != nil {
@@ -637,7 +652,7 @@ func mintImplicitToken(application *Application, username string, scope string, 
 		}, nil
 	}
 
-	token, err := GetTokenByUser(application, user, scope, nonce, host)
+	token, err := GetTokenByUser(application, user, scope, nonce, "", host)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -674,35 +689,36 @@ func parseAndValidateSubjectToken(subjectToken string, requestingClientId string
 		return "", "", "", &TokenError{Error: EndpointError, ErrorDescription: fmt.Sprintf("cert for issuing application %s cannot be found", unverifiedClaims.Azp)}, nil
 	}
 
+	var audience []string
 	if issuingApp.TokenFormat == "JWT-Standard" {
 		standardClaims, err := ParseStandardJwtToken(subjectToken, cert)
 		if err != nil {
 			return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("invalid subject_token: %s", err.Error())}, nil
 		}
-		return standardClaims.Owner, standardClaims.Name, standardClaims.Scope, nil, nil
-	}
-
-	claims, err := ParseJwtToken(subjectToken, cert)
-	if err != nil {
-		return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("invalid subject_token: %s", err.Error())}, nil
+		if standardClaims.UserStandard == nil {
+			return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token has no user"}, nil
+		}
+		owner, name, scope = standardClaims.Owner, standardClaims.Name, standardClaims.Scope
+		audience = standardClaims.Audience
+	} else {
+		claims, err := ParseJwtToken(subjectToken, cert)
+		if err != nil {
+			return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("invalid subject_token: %s", err.Error())}, nil
+		}
+		if claims.User == nil {
+			return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token has no user"}, nil
+		}
+		owner, name, scope = claims.Owner, claims.Name, claims.Scope
+		audience = claims.Audience
 	}
 
 	// Audience binding: requesting client must be the issuer itself or appear in token's aud.
 	// Prevents an attacker from exchanging App A's token to obtain an App B token (RFC 8693 §2.1).
-	if issuingApp.ClientId != requestingClientId {
-		audienceMatched := false
-		for _, aud := range claims.Audience {
-			if aud == requestingClientId {
-				audienceMatched = true
-				break
-			}
-		}
-		if !audienceMatched {
-			return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("subject_token audience does not include the requesting client '%s'", requestingClientId)}, nil
-		}
+	if issuingApp.ClientId != requestingClientId && !util.InSlice(audience, requestingClientId) {
+		return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("subject_token audience does not include the requesting client '%s'", requestingClientId)}, nil
 	}
 
-	return claims.Owner, claims.Name, claims.Scope, nil, nil
+	return owner, name, scope, nil, nil
 }
 
 // createGuestUserToken creates a new guest user and returns a token for them.

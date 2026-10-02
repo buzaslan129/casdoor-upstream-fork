@@ -42,6 +42,8 @@ const (
 
 const UserEnforcerId = "built-in/user-enforcer-built-in"
 
+const RequiredUpdatePassword = "RequiredUpdatePassword"
+
 var userEnforcer *UserGroupEnforcer
 
 func InitUserManager() {
@@ -196,6 +198,7 @@ type User struct {
 	Zoom            string `xorm:"zoom varchar(100)" json:"zoom"`
 	MetaMask        string `xorm:"metamask varchar(100)" json:"metamask"`
 	Web3Onboard     string `xorm:"web3onboard varchar(100)" json:"web3onboard"`
+	Oidc            string `xorm:"oidc varchar(100)" json:"oidc"`
 	Custom          string `xorm:"custom varchar(100)" json:"custom"`
 	Custom2         string `xorm:"custom2 text" json:"custom2"`
 	Custom3         string `xorm:"custom3 text" json:"custom3"`
@@ -225,7 +228,9 @@ type User struct {
 	FaceIds             []*FaceId             `json:"faceIds"`
 	Cart                []ProductInfo         `xorm:"mediumtext" json:"cart"`
 
-	Ldap       string            `xorm:"ldap varchar(100)" json:"ldap"`
+	Ldap string `xorm:"ldap varchar(100)" json:"ldap"`
+	// UidNumber is the POSIX uid published by the built-in LDAP server, 0 when unassigned.
+	UidNumber  int               `xorm:"index" json:"uidNumber"`
 	Properties map[string]string `json:"properties"`
 
 	ThirdPartyLinks []*ThirdPartyLink `xorm:"-" json:"thirdPartyLinks,omitempty"`
@@ -866,13 +871,14 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 			"eveonline", "fitbit", "gitea", "heroku", "influxcloud", "instagram", "intercom", "kakao", "lastfm", "mailru", "meetup",
 			"microsoftonline", "naver", "nextcloud", "onedrive", "oura", "patreon", "paypal", "salesforce", "shopify", "soundcloud",
 			"spotify", "strava", "stripe", "type", "telegram", "tiktok", "tumblr", "twitch", "twitter", "typetalk", "uber", "vk", "wepay", "xero", "yahoo",
-			"yammer", "yandex", "zoom", "custom", "need_update_password", "ip_whitelist", "mfa_remember_deadline",
+			"yammer", "yandex", "zoom", "oidc", "custom", "need_update_password", "ip_whitelist", "mfa_remember_deadline",
 			"cart", "application_scopes",
 		}
-	}
-	if isAdmin {
-		columns = append(columns, "name", "id", "email", "phone", "country_code", "type", "balance", "balance_credit", "balance_currency", "mfa_items", "register_type", "register_source",
-			"is_admin", "is_forbidden", "is_deleted")
+
+		if isAdmin {
+			columns = append(columns, "name", "id", "email", "phone", "country_code", "type", "balance", "balance_credit", "balance_currency", "mfa_items", "register_type", "register_source",
+				"is_admin", "is_forbidden", "is_deleted", "uid_number")
+		}
 	}
 
 	columns = append(columns, "updated_time")
@@ -892,6 +898,14 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 	affected, err := updateUser(id, user, columns)
 	if err != nil {
 		return false, err
+	}
+
+	if affected != 0 && isUserAccessRevoked(oldUser, user, columns) {
+		// The tokens and sessions are keyed by the old user name, it may have just been renamed
+		err = terminateUserAccess(oldUser)
+		if err != nil {
+			return true, fmt.Errorf("the user: %s is updated, but terminating its access failed: %w", id, err)
+		}
 	}
 
 	return affected != 0, nil
@@ -964,6 +978,13 @@ func UpdateUserForAllFields(id string, user *User) (bool, error) {
 		return false, err
 	}
 
+	if affected != 0 && isUserAccessRevoked(oldUser, user, nil) {
+		err = terminateUserAccess(oldUser)
+		if err != nil {
+			return true, fmt.Errorf("the user: %s is updated, but terminating its access failed: %w", id, err)
+		}
+	}
+
 	return affected != 0, nil
 }
 
@@ -1018,6 +1039,10 @@ func AddUser(user *User, lang string) (bool, error) {
 		} else {
 			user.BalanceCurrency = "USD"
 		}
+	}
+
+	if user.Avatar == "" {
+		user.Avatar = organization.DefaultAvatar
 	}
 
 	if organization.DefaultPassword != "" && user.Password == "123" {
@@ -1175,9 +1200,75 @@ func deleteUser(user *User) (bool, error) {
 	return affected != 0, nil
 }
 
+// isUserAccessRevoked checks whether an update has just forbidden or soft-deleted the user, the
+// columns are the ones the update actually wrote, a nil value means that all of them were written
+func isUserAccessRevoked(oldUser *User, user *User, columns []string) bool {
+	if oldUser.IsForbidden || oldUser.IsDeleted {
+		return false
+	}
+
+	if user.IsForbidden && (columns == nil || util.InSlice(columns, "is_forbidden")) {
+		return true
+	}
+	if user.IsDeleted && (columns == nil || util.InSlice(columns, "is_deleted")) {
+		return true
+	}
+
+	return false
+}
+
+// terminateUserAccess forces the user offline, it expires the user's tokens and drops all of its
+// sessions, in the same way as the "logout from all applications" flow. It does nothing when the
+// user has neither active tokens nor sessions, so it is safe to call it more than once
+func terminateUserAccess(user *User) error {
+	tokens, err := GetActiveTokensByUser(user.Owner, user.Name)
+	if err != nil {
+		return err
+	}
+
+	sessions, err := GetUserSessions(user.Owner, user.Name)
+	if err != nil {
+		return err
+	}
+
+	if len(tokens) == 0 && len(sessions) == 0 {
+		return nil
+	}
+
+	// The ids are collected for the SSO logout notification below, the Beego sessions
+	// themselves are destroyed by DeleteAllUserSessions()
+	sessionIds := []string{}
+	for _, session := range sessions {
+		sessionIds = append(sessionIds, session.SessionId...)
+	}
+
+	// The host is empty, so the issuer falls back to the configured origin
+	sendBackchannelLogoutForTokens(user, tokens, "", "")
+
+	_, err = ExpireTokenByUser(user.Owner, user.Name)
+	if err != nil {
+		return err
+	}
+
+	// The sessions are stored under the applications used at login, so all of them have to be
+	// dropped and not only the "app-built-in" one
+	_, err = DeleteAllUserSessions(user.Owner, user.Name)
+	if err != nil {
+		return err
+	}
+
+	// The notification is best-effort, the access has already been revoked at this point, so a
+	// slow or failing notification provider must not block or undo it
+	go func() {
+		_ = SendSsoLogoutNotifications(user, sessionIds, tokens)
+	}()
+
+	return nil
+}
+
 func DeleteUser(user *User) (bool, error) {
-	// Forced offline the user first
-	_, err := DeleteSession(util.GetSessionId(user.Owner, user.Name, CasdoorApplication), "")
+	// Forced offline the user first, its tokens would otherwise outlive the user row
+	err := terminateUserAccess(user)
 	if err != nil {
 		return false, err
 	}
@@ -1188,6 +1279,11 @@ func DeleteUser(user *User) (bool, error) {
 	}
 
 	_, err = DeleteThirdPartyLinksByUser(user.Owner, user.Name)
+	if err != nil {
+		return false, err
+	}
+
+	err = DeletePasswordHistoryByUser(user.Owner, user.Name)
 	if err != nil {
 		return false, err
 	}
@@ -1338,8 +1434,16 @@ func (user *User) GetFriendlyName() string {
 	}
 }
 
-func isUserIdGlobalAdmin(userId string) bool {
-	return strings.HasPrefix(userId, "built-in/") || IsAppUser(userId)
+func isUserIdGlobalAdmin(userId string) (bool, error) {
+	if strings.HasPrefix(userId, "built-in/") {
+		return true, nil
+	}
+
+	appUser, err := GetAppUser(userId)
+	if err != nil {
+		return false, err
+	}
+	return appUser.IsGlobalAdmin(), nil
 }
 
 func ExtendUserWithRolesAndPermissions(user *User) (err error) {
@@ -1390,15 +1494,20 @@ func userChangeTrigger(owner string, oldName string, newName string) error {
 	}
 
 	for _, role := range roles {
+		changed := false
 		for j, u := range role.Users {
 			// u = organization/username
 			roleOwner, roleName, err := util.GetOwnerAndNameFromIdWithError(u)
 			if err != nil {
 				return err
 			}
-			if roleName == oldName {
+			if roleOwner == owner && roleName == oldName {
 				role.Users[j] = util.GetId(roleOwner, newName)
+				changed = true
 			}
+		}
+		if !changed {
+			continue
 		}
 		_, err = session.Where("name=?", role.Name).And("owner=?", role.Owner).Update(role)
 		if err != nil {
@@ -1412,6 +1521,7 @@ func userChangeTrigger(owner string, oldName string, newName string) error {
 		return err
 	}
 	for _, permission := range permissions {
+		changed := false
 		for j, u := range permission.Users {
 			if u == "*" {
 				continue
@@ -1422,9 +1532,13 @@ func userChangeTrigger(owner string, oldName string, newName string) error {
 			if err != nil {
 				return err
 			}
-			if permName == oldName {
+			if permOwner == owner && permName == oldName {
 				permission.Users[j] = util.GetId(permOwner, newName)
+				changed = true
 			}
+		}
+		if !changed {
+			continue
 		}
 		_, err = session.Where("name=?", permission.Name).And("owner=?", permission.Owner).Update(permission)
 		if err != nil {
@@ -1432,14 +1546,22 @@ func userChangeTrigger(owner string, oldName string, newName string) error {
 		}
 	}
 
-	resource := new(Resource)
-	resource.User = newName
-	_, err = session.Where("user=?", oldName).Update(resource)
+	_, err = session.Where(fmt.Sprintf("owner = ? AND %s = ?", quoteColumn("user")), owner, oldName).Cols("user").Update(&Resource{User: newName})
 	if err != nil {
 		return err
 	}
 
 	_, err = session.Where("owner = ? AND user_name = ?", owner, oldName).Cols("user_name").Update(&ThirdPartyLink{UserName: newName})
+	if err != nil {
+		return err
+	}
+
+	_, err = session.Where("owner = ? AND name = ?", owner, oldName).Cols("name").Update(&PasswordHistory{Name: newName})
+	if err != nil {
+		return err
+	}
+
+	err = userEnforcer.RenameUser(util.GetId(owner, oldName), util.GetId(owner, newName))
 	if err != nil {
 		return err
 	}

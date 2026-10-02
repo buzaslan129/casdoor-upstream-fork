@@ -62,16 +62,30 @@ func HasUserByField(organizationName string, field string, value string) bool {
 	return user != nil
 }
 
-func HasUserByPhoneAndCountryCode(organizationName string, phone string, countryCode string) bool {
+func GetUserByPhoneAndCountryCode(organizationName string, phone string, countryCode string) (*User, error) {
 	if phone == "" {
-		return false
+		return nil, nil
 	}
+
 	user := User{Owner: organizationName, Phone: phone, CountryCode: countryCode}
 	existed, err := ormer.Engine.Get(&user)
 	if err != nil {
+		return nil, err
+	}
+
+	if existed {
+		return &user, nil
+	} else {
+		return nil, nil
+	}
+}
+
+func HasUserByPhoneAndCountryCode(organizationName string, phone string, countryCode string) bool {
+	user, err := GetUserByPhoneAndCountryCode(organizationName, phone, countryCode)
+	if err != nil {
 		panic(err)
 	}
-	return existed
+	return user != nil
 }
 
 func GetUserByFields(organization string, field string) (*User, error) {
@@ -753,6 +767,15 @@ func CheckPermissionForUpdateUser(oldUser, newUser *User, isAdmin bool, allowDis
 		}
 	}
 
+	if oldUser.UidNumber != newUser.UidNumber {
+		item := GetAccountItemByName("UID number", organization)
+		if !userVisible(isAdmin, item) {
+			newUser.UidNumber = oldUser.UidNumber
+		} else {
+			itemsChanged = append(itemsChanged, item)
+		}
+	}
+
 	if oldUser.Score != newUser.Score {
 		item := GetAccountItemByName("Score", organization)
 		if !userVisible(isAdmin, item) {
@@ -999,6 +1022,33 @@ func IsAppUser(userId string) bool {
 		return true
 	}
 	return false
+}
+
+// GetAppUser returns the virtual user an application credential ("app/<name>" or
+// "app-dcr/<name>") acts as: an admin of the application's organization, hence a
+// global admin only when the application belongs to the built-in organization. It
+// returns nil when userId is not an app user or the application doesn't exist.
+func GetAppUser(userId string) (*User, error) {
+	if !IsAppUser(userId) {
+		return nil, nil
+	}
+
+	_, name := util.GetOwnerAndNameFromIdNoCheck(userId)
+	application, err := getApplication("admin", name)
+	if err != nil || application == nil {
+		return nil, err
+	}
+
+	return &User{Owner: application.Organization, Name: userId, IsAdmin: true}, nil
+}
+
+// GetUserOrAppUser returns the real user for userId, or the virtual user of an
+// application credential, see GetAppUser().
+func GetUserOrAppUser(userId string) (*User, error) {
+	if IsAppUser(userId) {
+		return GetAppUser(userId)
+	}
+	return GetUser(userId)
 }
 
 func setReflectAttr[T any](fieldValue *reflect.Value, fieldString string) error {

@@ -86,8 +86,12 @@ func (c *McpController) isGlobalAdmin() (bool, *object.User) {
 	username := c.GetSessionUsername()
 
 	if object.IsAppUser(username) {
-		// e.g., "app/app-casnode"
-		return true, nil
+		// e.g., "app/app-casnode", an admin of the application's organization
+		appUser, err := object.GetAppUser(username)
+		if err != nil {
+			return false, nil
+		}
+		return appUser.IsGlobalAdmin(), appUser
 	}
 
 	user := c.getCurrentUser()
@@ -154,7 +158,13 @@ func (c *McpController) GetClaimsFromToken() *object.Claims {
 		return nil
 	}
 
-	application, err := object.GetApplication(token.Application)
+	// The token's user may have been forbidden or deleted after the token was issued
+	isUserActive, err := token.IsUserActive()
+	if err != nil || !isUserActive {
+		return nil
+	}
+
+	application, err := object.GetApplication(util.GetId(token.Owner, token.Application))
 	if err != nil || application == nil {
 		return nil
 	}

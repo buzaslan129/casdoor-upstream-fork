@@ -52,7 +52,7 @@ type Provider struct {
 	CustomUserInfoUrl string            `xorm:"varchar(200)" json:"customUserInfoUrl"`
 	CustomLogoutUrl   string            `xorm:"varchar(200)" json:"customLogoutUrl"`
 	CustomLogo        string            `xorm:"varchar(200)" json:"customLogo"`
-	Scopes            string            `xorm:"varchar(100)" json:"scopes"`
+	Scopes            string            `xorm:"varchar(200)" json:"scopes"`
 	UserMapping       map[string]string `xorm:"varchar(500)" json:"userMapping"`
 	HttpHeaders       map[string]string `xorm:"varchar(500)" json:"httpHeaders"`
 
@@ -61,7 +61,7 @@ type Provider struct {
 	DisableSsl bool   `json:"disableSsl"`                  // Deprecated: Use SslMode instead. If the provider type is WeChat, DisableSsl means EnableQRCode, if type is Google, it means sync phone number
 	SslMode    string `xorm:"varchar(100)" json:"sslMode"` // "Auto" (empty means Auto), "Enable", "Disable"
 	Title      string `xorm:"varchar(100)" json:"title"`
-	Content    string `xorm:"varchar(2000)" json:"content"` // If provider type is WeChat, Content means QRCode string by Base64 encoding
+	Content    string `xorm:"mediumtext" json:"content"` // If provider type is WeChat, Content means QRCode string by Base64 encoding
 	Receiver   string `xorm:"varchar(100)" json:"receiver"`
 
 	RegionId     string `xorm:"varchar(100)" json:"regionId"`
@@ -84,6 +84,8 @@ type Provider struct {
 	ProviderUrl string `xorm:"varchar(200)" json:"providerUrl"`
 	EnableProxy bool   `json:"enableProxy"`
 	EnablePkce  bool   `json:"enablePkce"`
+
+	RequireMessageAuthenticator bool `json:"requireMessageAuthenticator"`
 
 	State string `xorm:"varchar(100)" json:"state"`
 }
@@ -578,28 +580,40 @@ func providerChangeTrigger(owner string, oldName string, newName string) error {
 		return err
 	}
 
+	// global ("admin") providers are visible to every organization, others only to their own
 	var applications []*Application
-	err = ormer.Engine.Find(&applications)
+	if owner == "admin" {
+		err = ormer.Engine.Find(&applications)
+	} else {
+		err = ormer.Engine.Where("organization=?", owner).Find(&applications)
+	}
 	if err != nil {
 		return err
 	}
 	for i := 0; i < len(applications); i++ {
+		changed := false
 		providers := applications[i].Providers
 		for j := 0; j < len(providers); j++ {
 			if providers[j].Name == oldName {
 				providers[j].Name = newName
+				changed = true
 			}
 		}
+		if !changed {
+			continue
+		}
 		applications[i].Providers = providers
-		_, err = session.Where("name=?", applications[i].Name).Update(applications[i])
+		_, err = session.Where("owner=?", applications[i].Owner).And("name=?", applications[i].Name).Cols("providers").Update(applications[i])
 		if err != nil {
 			return err
 		}
 	}
 
-	resource := new(Resource)
-	resource.Provider = newName
-	_, err = session.Where("provider=?", oldName).Update(resource)
+	resourceSession := session.Where("provider=?", oldName)
+	if owner != "admin" {
+		resourceSession = resourceSession.And("owner=?", owner)
+	}
+	_, err = resourceSession.Cols("provider").Update(&Resource{Provider: newName})
 	if err != nil {
 		return err
 	}
@@ -634,7 +648,7 @@ func FromProviderToIdpInfo(ctx *context.Context, provider *Provider) (*idp.Provi
 			providerInfo.ClientId = provider.ClientId2
 			providerInfo.ClientSecret = provider.ClientSecret2
 		}
-	} else if provider.Type == "ADFS" || provider.Type == "AzureAD" || provider.Type == "AzureADB2C" || provider.Type == "Casdoor" || provider.Type == "Okta" {
+	} else if provider.Type == "ADFS" || provider.Type == "AzureAD" || provider.Type == "AzureADB2C" || provider.Type == "Casdoor" || provider.Type == "Okta" || provider.Type == "OIDC" {
 		providerInfo.HostUrl = provider.Domain
 	} else if provider.Type == "Alipay" && provider.Cert != "" {
 		cert, err := GetCert(util.GetId(provider.Owner, provider.Cert))
@@ -730,7 +744,7 @@ func InvokeCustomProviderLogout(application *Application, accessToken string) {
 
 	for _, providerItem := range application.Providers {
 		provider := providerItem.Provider
-		if provider == nil || provider.Category != "OAuth" || !strings.HasPrefix(provider.Type, "Custom") {
+		if provider == nil || provider.Category != "OAuth" || !IsCustomOAuthProvider(provider.Type) {
 			continue
 		}
 		if provider.CustomLogoutUrl == "" {

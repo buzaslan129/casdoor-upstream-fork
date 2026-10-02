@@ -39,6 +39,17 @@ func CheckUserSignup(application *Application, organization *Organization, authF
 		return i18n.Translate(lang, "check:Organization does not exist")
 	}
 
+	// Normalize the phone number before the duplication checks below
+	if authForm.Phone != "" {
+		normalizedPhone, normalizedCountryCode, ok := util.GetNormalizedPhone(authForm.Phone, authForm.CountryCode)
+		if !ok {
+			return i18n.Translate(lang, "check:Phone number is invalid")
+		}
+
+		authForm.Phone = normalizedPhone
+		authForm.CountryCode = normalizedCountryCode
+	}
+
 	if application.IsSignupItemVisible("Username") {
 		if len(authForm.Username) <= 1 {
 			return i18n.Translate(lang, "check:Username must have at least 2 characters")
@@ -78,7 +89,7 @@ func CheckUserSignup(application *Application, organization *Organization, authF
 		}
 	}
 
-	if application.IsSignupItemVisible("Email") {
+	if application.IsSignupFieldVisible("Email") {
 		if authForm.Email == "" {
 			if application.IsSignupItemRequired("Email") {
 				return i18n.Translate(lang, "check:Email cannot be empty")
@@ -93,7 +104,7 @@ func CheckUserSignup(application *Application, organization *Organization, authF
 		}
 	}
 
-	if application.IsSignupItemVisible("Phone") {
+	if application.IsSignupFieldVisible("Phone") {
 		if authForm.Phone == "" {
 			if application.IsSignupItemRequired("Phone") {
 				return i18n.Translate(lang, "check:Phone cannot be empty")
@@ -445,28 +456,25 @@ func CheckUserPermission(requestUserId, userId string, strict bool, lang string)
 		userOwner = targetUser.Owner
 	}
 
-	hasPermission := false
-	if IsAppUser(requestUserId) {
-		hasPermission = true
-	} else {
-		requestUser, err := GetUser(requestUserId)
-		if err != nil {
-			return false, err
-		}
+	requestUser, err := GetUserOrAppUser(requestUserId)
+	if err != nil {
+		return false, err
+	}
 
-		if requestUser == nil {
-			return false, errors.New(i18n.Translate(lang, "check:Session outdated, please login again"))
-		}
-		if requestUser.IsGlobalAdmin() {
+	if requestUser == nil {
+		return false, errors.New(i18n.Translate(lang, "check:Session outdated, please login again"))
+	}
+
+	hasPermission := false
+	if requestUser.IsGlobalAdmin() {
+		hasPermission = true
+	} else if requestUserId == userId {
+		hasPermission = true
+	} else if userOwner == requestUser.Owner {
+		if strict {
+			hasPermission = requestUser.IsAdmin
+		} else {
 			hasPermission = true
-		} else if requestUserId == userId {
-			hasPermission = true
-		} else if userOwner == requestUser.Owner {
-			if strict {
-				hasPermission = requestUser.IsAdmin
-			} else {
-				hasPermission = true
-			}
 		}
 	}
 
@@ -601,6 +609,14 @@ func CheckLoginPermission(userId string, application *Application) (bool, error)
 		return false, err
 	}
 	if owner == "built-in" {
+		return true, nil
+	}
+
+	user, err := GetUser(userId)
+	if err != nil {
+		return false, err
+	}
+	if user != nil && user.IsAdmin {
 		return true, nil
 	}
 
@@ -794,8 +810,21 @@ func CheckUpdateUser(oldUser, user *User, lang string) string {
 		}
 	}
 	if oldUser.Phone != user.Phone || oldUser.CountryCode != user.CountryCode {
-		if HasUserByPhoneAndCountryCode(user.Owner, user.Phone, user.CountryCode) {
-			return i18n.Translate(lang, "check:Phone already exists")
+		if user.Phone != "" {
+			normalizedPhone, normalizedCountryCode, ok := util.GetNormalizedPhone(user.Phone, user.GetCountryCode(""))
+			if !ok {
+				return i18n.Translate(lang, "check:Phone number is invalid")
+			}
+
+			user.Phone = normalizedPhone
+			user.CountryCode = normalizedCountryCode
+		}
+
+		// The normalization may have turned the new phone number into the old one
+		if oldUser.Phone != user.Phone || oldUser.CountryCode != user.CountryCode {
+			if HasUserByPhoneAndCountryCode(user.Owner, user.Phone, user.CountryCode) {
+				return i18n.Translate(lang, "check:Phone already exists")
+			}
 		}
 	}
 	if oldUser.IpWhitelist != user.IpWhitelist {

@@ -28,7 +28,7 @@ type Model struct {
 	Name        string `xorm:"varchar(100) notnull pk" json:"name"`
 	CreatedTime string `xorm:"varchar(100)" json:"createdTime"`
 	DisplayName string `xorm:"varchar(100)" json:"displayName"`
-	Description string `xorm:"varchar(100)" json:"description"`
+	Description string `xorm:"mediumtext" json:"description"`
 
 	ModelText string `xorm:"mediumtext" json:"modelText"`
 
@@ -130,7 +130,7 @@ func UpdateModel(id string, modelObj *Model) (bool, error) {
 	}
 
 	if name != modelObj.Name {
-		err := modelChangeTrigger(name, modelObj.Name)
+		err := modelChangeTrigger(owner, name, modelObj.Name)
 		if err != nil {
 			return false, err
 		}
@@ -142,6 +142,16 @@ func UpdateModel(id string, modelObj *Model) (bool, error) {
 	}
 
 	return affected != 0, err
+}
+
+func AddModelWithCheck(modelObj *Model) (bool, error) {
+	// check model grammar
+	_, err := model.NewModelFromString(modelObj.ModelText)
+	if err != nil {
+		return false, err
+	}
+
+	return AddModel(modelObj)
 }
 
 func AddModel(model *Model) (bool, error) {
@@ -166,7 +176,7 @@ func (m *Model) GetId() string {
 	return fmt.Sprintf("%s/%s", m.Owner, m.Name)
 }
 
-func modelChangeTrigger(oldName string, newName string) error {
+func modelChangeTrigger(owner string, oldName string, newName string) error {
 	session := ormer.Engine.NewSession()
 	defer session.Close()
 
@@ -175,17 +185,21 @@ func modelChangeTrigger(oldName string, newName string) error {
 		return err
 	}
 
+	// permission.Model and enforcer.Model store the full "owner/name" id
+	oldId := util.GetId(owner, oldName)
+	newId := util.GetId(owner, newName)
+
 	permission := new(Permission)
-	permission.Model = newName
-	_, err = session.Where("model=?", oldName).Update(permission)
+	permission.Model = newId
+	_, err = session.Where("model=?", oldId).Update(permission)
 	if err != nil {
 		session.Rollback()
 		return err
 	}
 
 	enforcer := new(Enforcer)
-	enforcer.Model = newName
-	_, err = session.Where("model=?", oldName).Update(enforcer)
+	enforcer.Model = newId
+	_, err = session.Where("model=?", oldId).Update(enforcer)
 	if err != nil {
 		session.Rollback()
 		return err
@@ -199,6 +213,26 @@ func HasRoleDefinition(m model.Model) bool {
 		return false
 	}
 	return m["g"] != nil
+}
+
+// HasDomainDefinition returns true if the model's request_definition contains a "dom" token,
+// e.g. "r = sub, dom, obj, act". Permissions with Domains set but built on a model without
+// this token would silently break, because the domain value ends up misaligned with the
+// resource/action columns during matching.
+func HasDomainDefinition(m model.Model) bool {
+	if m == nil {
+		return false
+	}
+	r, ok := m["r"]["r"]
+	if !ok {
+		return false
+	}
+	for _, token := range r.Tokens {
+		if token == "r_dom" {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Model) initModel() error {

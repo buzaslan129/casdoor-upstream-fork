@@ -42,7 +42,25 @@ type SmsForm struct {
 }
 
 type NotificationForm struct {
-	Content string `json:"content"`
+	Content   string `json:"content"`
+	Recipient string `json:"recipient"`
+}
+
+// checkServiceProvider checks that a non-global admin only sends with a provider of the category
+// that their organization can use: its own one, or a global one unless isOwnOnly. The authz filter
+// authorizes the "owner" of the request, while the provider is picked by its name.
+func (c *ApiController) checkServiceProvider(provider *object.Provider, category string, isOwnOnly bool) bool {
+	isGlobalAdmin, user := c.isGlobalAdmin()
+	if isGlobalAdmin {
+		return true
+	}
+
+	if user != nil && provider.Category == category && (provider.Owner == user.Owner || (!isOwnOnly && provider.Owner == "admin")) {
+		return true
+	}
+
+	c.ResponseError(c.T("auth:Unauthorized operation"))
+	return false
 }
 
 // SendEmail
@@ -92,8 +110,20 @@ func (c *ApiController) SendEmail() {
 		}
 	}
 
+	if provider == nil {
+		c.ResponseError(fmt.Sprintf(c.T("util:The provider: %s is not found"), emailForm.Provider))
+		return
+	}
+	if !c.checkServiceProvider(provider, "Email", false) {
+		return
+	}
+
 	if emailForm.ProviderObject.Name != "" {
 		if emailForm.ProviderObject.ClientSecret == "***" {
+			// the real secret is sent to the host of providerObject, so only for the provider's own organization
+			if !c.checkServiceProvider(provider, "Email", true) {
+				return
+			}
 			emailForm.ProviderObject.ClientSecret = provider.ClientSecret
 		}
 		provider = &emailForm.ProviderObject
@@ -178,6 +208,9 @@ func (c *ApiController) SendSms() {
 		c.ResponseError(err.Error())
 		return
 	}
+	if !c.checkServiceProvider(provider, "SMS", false) {
+		return
+	}
 
 	var smsForm SmsForm
 	err = json.Unmarshal(c.Ctx.Input.RequestBody, &smsForm)
@@ -216,6 +249,9 @@ func (c *ApiController) SendNotification() {
 		c.ResponseError(err.Error())
 		return
 	}
+	if !c.checkServiceProvider(provider, "Notification", false) {
+		return
+	}
 
 	var notificationForm NotificationForm
 	err = json.Unmarshal(c.Ctx.Input.RequestBody, &notificationForm)
@@ -224,7 +260,7 @@ func (c *ApiController) SendNotification() {
 		return
 	}
 
-	err = object.SendNotification(provider, notificationForm.Content)
+	err = object.SendNotification(provider, notificationForm.Content, notificationForm.Recipient)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return

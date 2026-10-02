@@ -56,6 +56,17 @@
     return query;
   }
 
+  function getParameterIgnoreCase(params, key) {
+    var target = key.toLowerCase();
+    var result = null;
+    params.forEach(function(val, name) {
+      if (result === null && name.toLowerCase() === target) {
+        result = val;
+      }
+    });
+    return result;
+  }
+
   function getInnerParams() {
     var params = new URLSearchParams(window.location.search);
     var state = params.get("state");
@@ -72,7 +83,7 @@
     if (method === "signup" || method === "signin") {
       var realRedirectUri = innerParams.get("redirect_uri");
       if (realRedirectUri === null) {
-        var samlRequest = innerParams.get("SAMLRequest");
+        var samlRequest = getParameterIgnoreCase(innerParams, "SAMLRequest");
         var casService = innerParams.get("service");
         if (samlRequest) {
           return "saml";
@@ -245,6 +256,19 @@
     return code;
   }
 
+  // The backend answers a login that still needs the user's consent with
+  // `data: {required: true}` instead of an authorization code.
+  function isConsentRequired(res) {
+    return !!(res.data && typeof res.data === "object" && res.data.required === true);
+  }
+
+  function goToConsentPage(applicationName, queryString) {
+    var url = new URL(getReactCallbackOrigin());
+    url.pathname = "/consent/" + encodeURIComponent(applicationName);
+    url.search = queryString || "";
+    window.location.replace(url.toString());
+  }
+
   function shouldFallbackToReact(res) {
     return res.data === "RequiredMfa" || res.data === "NextMfa" || res.data === "SelectPlan" || res.data === "BuyPlanResult" || res.data3;
   }
@@ -280,7 +304,7 @@
     var applicationName = innerParams.get("application");
     var providerName = innerParams.get("provider");
     var method = innerParams.get("method");
-    var samlRequest = innerParams.get("SAMLRequest");
+    var samlRequest = getParameterIgnoreCase(innerParams, "SAMLRequest");
     var code = extractCallbackCode(params);
     var responseType = getResponseType(innerParams);
     var redirectUri = window.location.origin + "/callback";
@@ -345,6 +369,13 @@
     var res = await response.json();
     if (res.status !== "ok") {
       setStatus(res.msg || "Failed to sign in.", true);
+      return;
+    }
+
+    // The consent page issues the real code, so it needs the original
+    // authorization request, which is what the state carries.
+    if (isConsentRequired(res)) {
+      goToConsentPage(applicationName, queryString);
       return;
     }
 
